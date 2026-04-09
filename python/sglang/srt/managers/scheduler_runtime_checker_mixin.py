@@ -195,7 +195,9 @@ class SchedulerRuntimeCheckerMixin:
         for req in batch.reqs:
             assert req.kv_committed_freed == req.kv_overallocated_freed
             uncached_len = 0
-            if not req.kv_committed_freed:
+            # Skip requests whose KV has been freed or transferred to a
+            # streaming session (req_pool_idx set to None by SessionAwareCache).
+            if not req.kv_committed_freed and req.req_pool_idx is not None:
                 allocated_len = req.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
@@ -205,6 +207,40 @@ class SchedulerRuntimeCheckerMixin:
             ret += uncached_len
 
         return ret
+
+    def _get_batch_swa_uncached_sizes(self: Scheduler, batch: ScheduleBatch) -> tuple:
+        """Get uncached sizes for both full and SWA pools in a single pass.
+
+        Returns:
+            (full_uncached, swa_uncached)
+
+        For full pool: uncached = allocated - cache_protected_len
+        For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
+
+        Note: swa_evicted_seqlen is NOT always >= cache_protected_len.
+        In some cases (e.g., first extend batch with overlap, or decode batch where
+        decode_batch_idx % sliding_window_size != 1), _evict_swa() is not called,
+        leaving swa_evicted_seqlen at its old value while cache_protected_len may
+        have increased.
+        """
+        full_uncached = 0
+        swa_uncached = 0
+        for req in batch.reqs:
+            assert req.kv_committed_freed == req.kv_overallocated_freed
+            if req.kv_committed_freed or req.req_pool_idx is None:
+                continue
+
+            allocated_len = req.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.cache_protected_len % self.page_size == 0
+
+            full_uncached += allocated_len - req.cache_protected_len
+            swa_uncached += allocated_len - max(
+                req.cache_protected_len, req.swa_evicted_seqlen
+            )
+
+        return full_uncached, swa_uncached
 
     def self_check_during_busy(self: Scheduler):
         current_batch: ScheduleBatch = self.last_batch
@@ -219,6 +255,12 @@ class SchedulerRuntimeCheckerMixin:
             )
             return
 
+        if self.is_hybrid_swa:
+            self._self_check_during_busy_swa(current_batch)
+        else:
+            self._self_check_during_busy_default(current_batch)
+
+    def _self_check_during_busy_default(self: Scheduler, current_batch: ScheduleBatch):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
 
@@ -246,6 +288,78 @@ class SchedulerRuntimeCheckerMixin:
         assert (
             total_tokens == self.max_total_num_tokens
         ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"
+
+    def _self_check_during_busy_swa(self: Scheduler, current_batch: ScheduleBatch):
+        """Check SWA memory invariant during busy periods.
+
+        Invariant for each pool:
+            total_size = available + evictable + protected + uncached + session_held
+
+        For SWA pool, tombstone nodes' tokens are in 'available' (freed via
+        free_swa), not in 'evictable'.
+        """
+        (
+            _,
+            _,
+            _,
+            _,
+            full_available,
+            full_evictable,
+            swa_available,
+            swa_evictable,
+        ) = self._get_swa_token_info()
+
+        if self.tree_cache.is_tree_cache():
+            full_protected = self.tree_cache.full_protected_size()
+            swa_protected = self.tree_cache.swa_protected_size()
+        else:
+            full_protected = 0
+            swa_protected = 0
+
+        full_uncached, swa_uncached = self._get_batch_swa_uncached_sizes(current_batch)
+
+        if (
+            self.running_batch is not None
+            and self.running_batch is not current_batch
+            and not self.running_batch.is_empty()
+        ):
+            f_unc, s_unc = self._get_batch_swa_uncached_sizes(self.running_batch)
+            full_uncached += f_unc
+            swa_uncached += s_unc
+
+        full_session_held = self._session_held_full_tokens()
+        swa_session_held = self._session_held_swa_tokens()
+
+        full_total = (
+            full_available
+            + full_evictable
+            + full_protected
+            + full_uncached
+            + full_session_held
+        )
+        swa_total = (
+            swa_available
+            + swa_evictable
+            + swa_protected
+            + swa_uncached
+            + swa_session_held
+        )
+
+        if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
+            logger.info(
+                f"[Mem Check (BUSY/SWA)] "
+                f"full: ({full_available=} + {full_evictable=} + {full_protected=} + {full_uncached=} + {full_session_held=}) = {full_total} | "
+                f"swa: ({swa_available=} + {swa_evictable=} + {swa_protected=} + {swa_uncached=} + {swa_session_held=}) = {swa_total}"
+            )
+
+        assert full_total == self.full_tokens_per_layer, (
+            f"Full Pool Mem Leak Detected! {full_total=} vs {self.full_tokens_per_layer=}, "
+            f"{full_available=}, {full_evictable=}, {full_protected=}, {full_uncached=}, {full_session_held=}"
+        )
+        assert swa_total == self.swa_tokens_per_layer, (
+            f"SWA Pool Mem Leak Detected! {swa_total=} vs {self.swa_tokens_per_layer=}, "
+            f"{swa_available=}, {swa_evictable=}, {swa_protected=}, {swa_uncached=}, {swa_session_held=}"
+        )
 
     def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
